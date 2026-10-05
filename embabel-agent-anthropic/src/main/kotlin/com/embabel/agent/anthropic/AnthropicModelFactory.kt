@@ -101,6 +101,7 @@ open class AnthropicModelFactory(
         val builder = AnthropicOkHttpClient.builder()
             .apiKey(apiKey)
             .timeout(READ_TIMEOUT)
+            .addInterceptor(AssistantTurnReplay())
         if (!baseUrl.isNullOrBlank()) {
             logger.info("Using custom Anthropic base URL: {}", baseUrl)
             builder.baseUrl(baseUrl)

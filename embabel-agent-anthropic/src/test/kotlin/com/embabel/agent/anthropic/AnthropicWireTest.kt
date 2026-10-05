@@ -17,6 +17,7 @@ package com.embabel.agent.anthropic
 
 import com.embabel.agent.api.models.AnthropicModels
 import com.embabel.chat.AssistantMessageWithToolCalls
+import com.embabel.chat.ToolResultMessage
 import com.embabel.chat.UserMessage
 import com.embabel.common.ai.model.LlmOptions
 import com.embabel.common.ai.model.Thinking
@@ -67,9 +68,12 @@ class AnthropicWireTest {
         server.stop(0)
     }
 
-    private fun send(model: String, options: LlmOptions = LlmOptions()) =
+    private fun service(model: String) =
         AnthropicModelFactory(apiKey = "test-key", baseUrl = "http://localhost:${server.address.port}")
             .build(model)
+
+    private fun send(model: String, options: LlmOptions = LlmOptions()) =
+        service(model)
             .createMessageSender(options)
             .call(listOf(UserMessage("Reply READY")), emptyList())
 
@@ -104,6 +108,52 @@ class AnthropicWireTest {
 
         assertEquals("Looking it up.", response.textContent)
         assertEquals("lookup", (response.message as AssistantMessageWithToolCalls).toolCalls.single().name)
+    }
+
+    /**
+     * Claude Fable 5.1, Opus 5.5 and Sonnet 5.5 reject a request whose earlier assistant turn
+     * differs from what they returned, reordered blocks included
+     * (platform.claude.com/docs/en/build-with-claude/preserved-thinking#prefix-check).
+     */
+    @Test
+    fun `a tool-calling turn goes back to Claude exactly as it was returned`() {
+        val returned = """[{"type":"thinking","thinking":"","signature":"sig1"},
+            {"type":"text","text":"Looking it up."},
+            {"type":"thinking","thinking":"","signature":"sig2"},
+            {"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"x"}}]"""
+        responseContent = returned
+        val sender = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions())
+        val user = UserMessage("Look it up")
+
+        val first = sender.call(listOf(user), emptyList())
+        responseContent = """[{"type":"text","text":"Done"}]"""
+        sender.call(listOf(user, first.message, ToolResultMessage("toolu_1", "lookup", "found")), emptyList())
+
+        assertEquals("assistant", request["messages"][1]["role"].asText())
+        assertEquals(ObjectMapper().readTree(returned), request["messages"][1]["content"])
+    }
+
+    /**
+     * A turn this client never saw (another instance, a restart) can't be restored. Thinking
+     * dropped from the start of the history is accepted where a reordered turn is not.
+     */
+    @Test
+    fun `a tool-calling turn this client did not record goes back without its thinking`() {
+        responseContent = """[{"type":"thinking","thinking":"","signature":"sig1"},
+            {"type":"text","text":"Looking it up."},
+            {"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]"""
+        val user = UserMessage("Look it up")
+        val first = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions())
+            .call(listOf(user), emptyList())
+
+        responseContent = """[{"type":"text","text":"Done"}]"""
+        service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions())
+            .call(listOf(user, first.message, ToolResultMessage("toolu_1", "lookup", "found")), emptyList())
+
+        assertEquals(
+            listOf("text", "tool_use"),
+            request["messages"][1]["content"].map { it["type"].asText() },
+        )
     }
 
     /**
