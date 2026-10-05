@@ -16,6 +16,7 @@
 package com.embabel.agent.anthropic
 
 import com.embabel.agent.api.models.AnthropicModels
+import com.embabel.agent.api.tool.Tool
 import com.embabel.agent.spi.loop.streaming.LlmInferenceStreamEvent
 import com.embabel.chat.AssistantMessageWithToolCalls
 import com.embabel.chat.ToolResultMessage
@@ -204,6 +205,44 @@ class AnthropicWireTest {
         ).blockLast()
 
         assertEquals(listOf("text", "tool_use"), blockTypes(request["messages"][1]["content"]))
+    }
+
+    /**
+     * Thinking is signed against the system prompt, tools and earlier messages it was produced
+     * under; a tool added mid-loop invalidates it.
+     */
+    @Test
+    fun `a recorded turn goes back without its thinking once the tools change`() {
+        responseContent = """[{"type":"thinking","thinking":"","signature":"sig1"},
+            {"type":"text","text":"Looking it up."},
+            {"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]"""
+        val lookup = Tool.of("lookup", "Look something up") { _ -> Tool.Result.text("found") }
+        val extra = Tool.of("extra", "Something else") { _ -> Tool.Result.text("more") }
+        val sender = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions())
+        val user = UserMessage("Look it up")
+
+        val first = sender.call(listOf(user), listOf(lookup))
+        responseContent = """[{"type":"text","text":"Done"}]"""
+        sender.call(listOf(user, first.message, ToolResultMessage("toolu_1", "lookup", "found")), listOf(lookup, extra))
+
+        assertEquals(2, request["tools"].size())
+        assertEquals(listOf("text", "tool_use"), blockTypes(request["messages"][1]["content"]))
+    }
+
+    @Test
+    fun `a recorded turn keeps its thinking while the tools stay the same`() {
+        responseContent = """[{"type":"thinking","thinking":"","signature":"sig1"},
+            {"type":"text","text":"Looking it up."},
+            {"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]"""
+        val lookup = Tool.of("lookup", "Look something up") { _ -> Tool.Result.text("found") }
+        val sender = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions())
+        val user = UserMessage("Look it up")
+
+        val first = sender.call(listOf(user), listOf(lookup))
+        responseContent = """[{"type":"text","text":"Done"}]"""
+        sender.call(listOf(user, first.message, ToolResultMessage("toolu_1", "lookup", "found")), listOf(lookup))
+
+        assertEquals(listOf("thinking", "text", "tool_use"), blockTypes(request["messages"][1]["content"]))
     }
 
     /** Spring AI groups thinking ahead of tool calls, so even a turn without text can be reordered. */

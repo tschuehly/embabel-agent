@@ -23,9 +23,12 @@ import com.anthropic.core.http.HttpRequestBody
 import com.anthropic.core.http.HttpResponse
 import com.anthropic.core.http.Interceptor
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ArrayNode
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
 import com.fasterxml.jackson.databind.node.ObjectNode
 import org.slf4j.LoggerFactory
+import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.CompletableFuture
 
@@ -39,8 +42,12 @@ import java.util.concurrent.CompletableFuture
  * This interceptor records the content of each Messages response that calls tools and puts it
  * back in place of the rebuilt turn, matched on the turn's tool_use ids.
  *
+ * A thinking block is also signed against the system prompt, the tools and the messages before
+ * it, and embabel changes those mid-loop (dynamic tool injection, history transforms). Each
+ * record keeps a digest of that prefix; a turn whose prefix no longer matches counts as unproven.
+ *
  * A turn carrying thinking that it has no record of (evicted, streamed, or from before a
- * restart) can't be proven unchanged, so its thinking blocks and every earlier one are left out instead: the API accepts
+ * restart), or whose prefix changed, can't be proven unchanged, so its thinking blocks and every earlier one are left out instead: the API accepts
  * thinking dropped from the start of the history, at the cost of that reasoning.
  *
  * ponytail: remembers the last [MAX_TURNS] tool-calling turns per client, in memory and only from
@@ -50,9 +57,12 @@ internal class AssistantTurnReplay : Interceptor {
 
     private val logger = LoggerFactory.getLogger(AssistantTurnReplay::class.java)
 
-    private val turns: MutableMap<String, ArrayNode> = Collections.synchronizedMap(
-        object : LinkedHashMap<String, ArrayNode>() {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ArrayNode>) = size > MAX_TURNS
+    /** What Claude returned, and a digest of the prefix it was produced under. */
+    private class Turn(val content: ArrayNode, val prefix: String)
+
+    private val turns: MutableMap<String, Turn> = Collections.synchronizedMap(
+        object : LinkedHashMap<String, Turn>() {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Turn>) = size > MAX_TURNS
         }
     )
 
@@ -61,7 +71,8 @@ internal class AssistantTurnReplay : Interceptor {
             if (!isCreateMessage(request)) {
                 return httpClient.execute(request, requestOptions)
             }
-            return record(httpClient.execute(replay(request), requestOptions))
+            val (sent, prefix) = replay(request)
+            return record(httpClient.execute(sent, requestOptions), prefix)
         }
 
         override fun executeAsync(
@@ -69,7 +80,7 @@ internal class AssistantTurnReplay : Interceptor {
             requestOptions: RequestOptions,
         ): CompletableFuture<HttpResponse> =
             // Streamed responses aren't recorded, so this only strips thinking it can't prove.
-            httpClient.executeAsync(if (isCreateMessage(request)) replay(request) else request, requestOptions)
+            httpClient.executeAsync(if (isCreateMessage(request)) replay(request).first else request, requestOptions)
 
         override fun close() = httpClient.close()
     }
@@ -77,54 +88,77 @@ internal class AssistantTurnReplay : Interceptor {
     private fun isCreateMessage(request: HttpRequest) =
         request.method == HttpMethod.POST && request.pathSegments == listOf("v1", "messages")
 
-    private fun replay(request: HttpRequest): HttpRequest {
+    /**
+     * Returns the request to send, and the digest of its whole prefix, which is what the turn
+     * Claude answers with is produced under.
+     */
+    private fun replay(request: HttpRequest): Pair<HttpRequest, String?> {
         val buffered = request.buffered()
-        val body = buffered.body?.json(JsonNode::class.java) ?: return buffered
-        val assistantTurns = body["messages"]?.filterIsInstance<ObjectNode>()
-            ?.filter { it["role"]?.asText() == "assistant" && it["content"] is ArrayNode }
-            .orEmpty()
+        val body = buffered.body?.json(JsonNode::class.java) as? ObjectNode ?: return buffered to null
+        val messages = body["messages"]?.filterIsInstance<ObjectNode>().orEmpty()
         var changed = false
-        var lastUnreplayable = -1
-        assistantTurns.forEachIndexed { index, message ->
-            val content = message["content"] as ArrayNode
+        var lastUnproven = -1
+        messages.forEachIndexed { index, message ->
+            val content = message["content"] as? ArrayNode
+            if (message["role"]?.asText() != "assistant" || content == null) {
+                return@forEachIndexed
+            }
             val ids = toolUseIds(content)
-            val returned = ids.firstOrNull()?.let { turns[it] }
-            if (returned != null && toolUseIds(returned) == ids) {
-                if (returned != content) {
-                    message.set<JsonNode>("content", returned.deepCopy())
-                    changed = true
-                }
-            } else if (content.any { it["type"]?.asText() in THINKING_TYPES }) {
-                // Unproven: Spring AI's rebuild groups all text, then all thinking, then all tool
-                // calls, so even a turn without text may not match what Claude returned.
-                lastUnreplayable = index
+            val returned = ids.firstOrNull()?.let { turns[it] }?.takeIf { toolUseIds(it.content) == ids }
+            if (returned != null && returned.content != content) {
+                message.set<JsonNode>("content", returned.content.deepCopy())
+                changed = true
+            }
+            // Unproven: no record (Spring AI's rebuild groups all text, then all thinking, then all
+            // tool calls, so it may not match what Claude returned), or the system prompt, tools or
+            // an earlier message changed since Claude produced the turn.
+            val proven = returned != null && returned.prefix == digest(body, messages, index)
+            if (!proven && (message["content"] as ArrayNode).any { it.isThinking() }) {
+                lastUnproven = index
             }
         }
-        // A turn not recorded here (evicted, streamed, or from before a restart) can't be restored.
-        // Dropping thinking from the start of the history is allowed; editing it is not.
-        if (lastUnreplayable >= 0) {
+        // Dropping thinking from the start of the history is allowed; editing what precedes it is not.
+        if (lastUnproven >= 0) {
             logger.warn(
-                "Cannot send an earlier assistant turn back as Claude returned it, so thinking up to that turn is left out"
+                "Cannot prove an earlier assistant turn goes back to Claude as it was produced, so thinking up to that turn is left out"
             )
-            assistantTurns.take(lastUnreplayable + 1).forEach { message ->
-                (message["content"] as ArrayNode).removeAll { it["type"]?.asText() in THINKING_TYPES }
+            messages.take(lastUnproven + 1).forEach { message ->
+                (message["content"] as? ArrayNode)?.removeAll { it.isThinking() }
             }
             changed = true
         }
+        val prefix = digest(body, messages, messages.size)
         if (!changed) {
-            return buffered
+            return buffered to prefix
         }
-        return buffered.toBuilder().body(HttpRequestBody.ofJson(body)).build()
+        return buffered.toBuilder().body(HttpRequestBody.ofJson(body)).build() to prefix
     }
 
-    private fun record(response: HttpResponse): HttpResponse {
+    /**
+     * Digest of what a thinking block is signed against: the system prompt, the tools and the
+     * messages before it. Earlier thinking and `cache_control` markers are not part of it.
+     */
+    private fun digest(body: ObjectNode, messages: List<ObjectNode>, count: Int): String {
+        val prefix = JsonNodeFactory.instance.objectNode()
+        body["system"]?.let { prefix.set<JsonNode>("system", it.deepCopy()) }
+        body["tools"]?.let { prefix.set<JsonNode>("tools", it.deepCopy()) }
+        prefix.putArray("messages").addAll(messages.take(count).map { it.deepCopy() })
+        prefix.findParents("cache_control").forEach { (it as ObjectNode).remove("cache_control") }
+        prefix["messages"].forEach { (it["content"] as? ArrayNode)?.removeAll { block -> block.isThinking() } }
+        return MessageDigest.getInstance("SHA-256").digest(MAPPER.writeValueAsBytes(prefix))
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    private fun JsonNode.isThinking() = this["type"]?.asText() in THINKING_TYPES
+
+    private fun record(response: HttpResponse, prefix: String?): HttpResponse {
         val isJson = response.headers().values("Content-Type").any { it.startsWith("application/json") }
-        if (response.statusCode() != 200 || !isJson) {
+        if (response.statusCode() != 200 || !isJson || prefix == null) {
             return response
         }
         val buffered = response.buffered()
         val content = runCatching { buffered.json(JsonNode::class.java)["content"] as? ArrayNode }.getOrNull()
-        content?.let { toolUseIds(it).firstOrNull()?.let { id -> turns[id] = it } }
+        content?.let { toolUseIds(it).firstOrNull()?.let { id -> turns[id] = Turn(it, prefix) } }
         return buffered
     }
 
@@ -134,5 +168,6 @@ internal class AssistantTurnReplay : Interceptor {
     companion object {
         const val MAX_TURNS = 1_000
         private val THINKING_TYPES = setOf("thinking", "redacted_thinking")
+        private val MAPPER = ObjectMapper()
     }
 }
