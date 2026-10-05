@@ -229,6 +229,32 @@ class AnthropicWireTest {
         assertEquals(listOf("text", "tool_use"), blockTypes(request["messages"][1]["content"]))
     }
 
+    /** `cache_control` is only a marker where Anthropic places one; elsewhere it is the caller's data. */
+    @Test
+    fun `a recorded turn goes back without its thinking once a schema property named cache_control changes`() {
+        responseContent = """[{"type":"thinking","thinking":"","signature":"sig-schema"},
+            {"type":"text","text":"Looking it up."},
+            {"type":"tool_use","id":"schema","name":"lookup","input":{}}]"""
+        fun lookup(allowed: String) = Tool.of(
+            "lookup", "Look something up",
+            Tool.InputSchema.of(Tool.Parameter("cache_control", Tool.ParameterType.STRING, "Allowed values: $allowed")),
+        ) { _ -> Tool.Result.text("found") }
+        val sender = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions())
+        val user = UserMessage("Look it up")
+
+        val first = sender.call(listOf(user), listOf(lookup("public")))
+        responseContent = """[{"type":"text","text":"Done"}]"""
+        sender.call(
+            listOf(user, first.message, ToolResultMessage("schema", "lookup", "found")), listOf(lookup("private")),
+        )
+
+        assertEquals(
+            "Allowed values: private",
+            request["tools"][0]["input_schema"]["properties"]["cache_control"]["description"].asText(),
+        )
+        assertEquals(listOf("text", "tool_use"), blockTypes(request["messages"][1]["content"]))
+    }
+
     @Test
     fun `a recorded turn keeps its thinking while the tools stay the same`() {
         responseContent = """[{"type":"thinking","thinking":"","signature":"sig1"},

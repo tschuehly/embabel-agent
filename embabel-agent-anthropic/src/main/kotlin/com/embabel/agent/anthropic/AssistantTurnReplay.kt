@@ -143,7 +143,12 @@ internal class AssistantTurnReplay : Interceptor {
         body["system"]?.let { prefix.set<JsonNode>("system", it.deepCopy()) }
         body["tools"]?.let { prefix.set<JsonNode>("tools", it.deepCopy()) }
         prefix.putArray("messages").addAll(messages.take(count).map { it.deepCopy() })
-        prefix.findParents("cache_control").forEach { (it as ObjectNode).remove("cache_control") }
+        // Markers sit on system blocks, tools and content blocks (tool results nest blocks of their
+        // own). Anywhere else, such as inside a tool's input_schema, cache_control is the caller's data.
+        val blocks = prefix["messages"].flatMap { it["content"] as? ArrayNode ?: emptyList() }
+        (listOf(prefix["system"], prefix["tools"]).flatMap { it as? ArrayNode ?: emptyList() } +
+            blocks + blocks.flatMap { it["content"] as? ArrayNode ?: emptyList() })
+            .forEach { (it as? ObjectNode)?.remove("cache_control") }
         prefix["messages"].forEach { (it["content"] as? ArrayNode)?.removeAll { block -> block.isThinking() } }
         return MessageDigest.getInstance("SHA-256").digest(MAPPER.writeValueAsBytes(prefix))
             .joinToString("") { "%02x".format(it) }
