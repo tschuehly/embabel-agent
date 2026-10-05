@@ -17,8 +17,17 @@ package com.embabel.agent.anthropic
 
 import com.embabel.agent.api.models.AnthropicModels
 import com.embabel.agent.api.tool.Tool
+import com.embabel.agent.api.tool.callback.AfterLlmCallContext
+import com.embabel.agent.api.tool.callback.ToolLoopTransformer
+import com.embabel.agent.api.tool.config.ToolLoopConfiguration
+import com.embabel.agent.api.tool.ToolCallContext
+import com.embabel.agent.spi.loop.AutoCorrectionPolicy
+import com.embabel.agent.spi.loop.ToolInjectionStrategy
+import com.embabel.agent.spi.loop.ToolLoopFactory
+import com.embabel.agent.spi.support.ExecutorAsyncer
 import com.embabel.agent.spi.loop.streaming.LlmInferenceStreamEvent
 import com.embabel.chat.AssistantMessageWithToolCalls
+import com.embabel.chat.Message
 import com.embabel.chat.ToolResultMessage
 import com.embabel.chat.UserMessage
 import com.embabel.common.ai.model.LlmOptions
@@ -41,6 +50,8 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+import tools.jackson.databind.json.JsonMapper
 
 /**
  * Drives a real [org.springframework.ai.anthropic.AnthropicChatModel] against a local stub of
@@ -232,6 +243,56 @@ class AnthropicWireTest {
 
         assertEquals(2, request["tools"].size())
         assertEquals(listOf("text", "tool_use"), blockTypes(request["messages"][1]["content"]))
+    }
+
+    /**
+     * A transformer may correct a tool call or redact text after the model answers; the tool runs
+     * the corrected call, so the history Claude sees next must show it, not the recorded original.
+     */
+    @Test
+    fun `a turn a transformer edited goes back as edited and without its thinking`() {
+        responseContent = """[{"type":"thinking","thinking":"","signature":"sig-edit"},
+            {"type":"text","text":"Original private value"},
+            {"type":"tool_use","id":"toolu_edit","name":"lookup","input":{"q":"original"}}]"""
+        val executed = CopyOnWriteArrayList<String>()
+        val lookup = Tool.of(
+            "lookup", "Look something up", Tool.InputSchema.of(Tool.Parameter.string("q", "query")),
+        ) { input ->
+            executed += input
+            responseContent = """[{"type":"text","text":"Done"}]"""
+            Tool.Result.text("found")
+        }
+        val correcting = object : ToolLoopTransformer {
+            override fun transformAfterLlmCall(context: AfterLlmCallContext): Message {
+                val response = context.response as? AssistantMessageWithToolCalls ?: return context.response
+                return AssistantMessageWithToolCalls(
+                    content = "Redacted",
+                    toolCalls = response.toolCalls.map { it.copy(arguments = """{"q":"corrected"}""") },
+                    metadata = response.metadata,
+                )
+            }
+        }
+        val loop = ToolLoopFactory.create(
+            ToolLoopConfiguration(), ExecutorAsyncer(Executors.newSingleThreadExecutor()), AutoCorrectionPolicy(),
+        ).create(
+            llmMessageSender = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions()),
+            objectMapper = JsonMapper.builder().build(),
+            injectionStrategy = ToolInjectionStrategy.NONE,
+            maxIterations = 5,
+            toolDecorator = null,
+            toolLoopInspectors = emptyList(),
+            toolLoopTransformers = listOf(correcting),
+            toolCallInspectors = emptyList(),
+            toolCallContext = ToolCallContext.EMPTY,
+        )
+
+        loop.execute(listOf(UserMessage("Look it up")), listOf(lookup)) { it }
+
+        assertEquals(listOf("""{"q":"corrected"}"""), executed)
+        val sent = request["messages"][1]["content"]
+        assertEquals(listOf("text", "tool_use"), blockTypes(sent))
+        assertEquals("Redacted", sent[0]["text"].asText())
+        assertEquals("corrected", sent[1]["input"]["q"].asText())
     }
 
     /** `cache_control` is only a marker where Anthropic places one; elsewhere it is the caller's data. */

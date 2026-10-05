@@ -40,7 +40,8 @@ import java.util.concurrent.CompletableFuture
  * `[text, thinking, tool_use]`. Claude Fable 5.1, Opus 5.5 and Sonnet 5.5 reject any edit to an
  * earlier turn with a 400 (platform.claude.com/docs/en/build-with-claude/preserved-thinking#prefix-check).
  * This interceptor records the content of each Messages response that calls tools and puts it
- * back in place of the rebuilt turn, matched on the turn's tool_use ids.
+ * back in place of the rebuilt turn, matched on the turn's tool_use ids, but only when the rebuild
+ * carries the same text and tool calls: a turn the caller edited goes out as edited, unproven.
  *
  * A thinking block is also signed against the system prompt, the tools and the messages before
  * it, and embabel changes those mid-loop (dynamic tool injection, history transforms). Each
@@ -104,7 +105,10 @@ internal class AssistantTurnReplay : Interceptor {
                 return@forEachIndexed
             }
             val ids = toolUseIds(content)
-            val returned = ids.firstOrNull()?.let { turns[it] }?.takeIf { toolUseIds(it.content) == ids }
+            // Only an unedited rebuild is put back: a transformer may have corrected a tool call or
+            // removed text, and that edit is what was executed, so it goes out as the caller sent it.
+            val returned = ids.firstOrNull()?.let { turns[it] }
+                ?.takeIf { toolUseIds(it.content) == ids && rebuilt(it.content) == rebuilt(content) }
             if (returned != null && returned.content != content) {
                 message.set<JsonNode>("content", returned.content.deepCopy())
                 changed = true
@@ -152,6 +156,18 @@ internal class AssistantTurnReplay : Interceptor {
         prefix["messages"].forEach { (it["content"] as? ArrayNode)?.removeAll { block -> block.isThinking() } }
         return MessageDigest.getInstance("SHA-256").digest(MAPPER.writeValueAsBytes(prefix))
             .joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * What Spring AI keeps of a turn when it rebuilds it: the text, joined, and every other
+     * non-thinking block in order. Equal for a recorded turn and its unedited rebuild.
+     */
+    private fun rebuilt(content: ArrayNode): List<JsonNode> {
+        val blocks = content.filterNot { it.isThinking() }
+        val text = blocks.filter { it["type"]?.asText() == "text" }.joinToString("") { it["text"]?.asText().orEmpty() }
+        val others = blocks.filter { it["type"]?.asText() != "text" }
+            .map { (it.deepCopy() as JsonNode).also { block -> (block as? ObjectNode)?.remove("cache_control") } }
+        return listOf(JsonNodeFactory.instance.textNode(text)) + others
     }
 
     private fun JsonNode.isThinking() = this["type"]?.asText() in THINKING_TYPES
