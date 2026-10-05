@@ -16,6 +16,8 @@
 package com.embabel.agent.anthropic
 
 import com.embabel.agent.api.models.AnthropicModels
+import com.embabel.agent.api.tool.Tool
+import com.embabel.agent.spi.loop.streaming.LlmInferenceStreamEvent
 import com.embabel.chat.AssistantMessageWithToolCalls
 import com.embabel.chat.ToolResultMessage
 import com.embabel.chat.UserMessage
@@ -51,12 +53,13 @@ class AnthropicWireTest {
         server = HttpServer.create(InetSocketAddress(0), 0)
         server.createContext("/v1/messages") { exchange ->
             request = ObjectMapper().readTree(exchange.requestBody.use { it.readBytes() })
-            val body = """
+            val streamed = request["stream"]?.asBoolean() == true
+            val body = (if (streamed) sse(responseContent) else """
                 {"id":"msg_test","type":"message","role":"assistant","content":$responseContent,
                  "model":"test","stop_reason":"end_turn","stop_sequence":null,
                  "usage":{"input_tokens":5,"output_tokens":2}}
-            """.trimIndent().toByteArray()
-            exchange.responseHeaders.set("Content-Type", "application/json")
+            """.trimIndent()).toByteArray()
+            exchange.responseHeaders.set("Content-Type", if (streamed) "text/event-stream" else "application/json")
             exchange.sendResponseHeaders(200, body.size.toLong())
             exchange.responseBody.use { it.write(body) }
         }
@@ -67,6 +70,32 @@ class AnthropicWireTest {
     fun tearDown() {
         server.stop(0)
     }
+
+    /** The Messages streaming events that deliver [content]. */
+    private fun sse(content: String): String {
+        val mapper = ObjectMapper()
+        fun event(type: String, data: String) = "event: $type\ndata: $data\n\n"
+        return buildString {
+            append(event("message_start", """{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":1}}}"""))
+            mapper.readTree(content).forEachIndexed { index, block ->
+                val (start, delta) = when (block["type"].asText()) {
+                    "thinking" -> """{"type":"thinking","thinking":"","signature":""}""" to
+                        """{"type":"signature_delta","signature":${mapper.writeValueAsString(block["signature"].asText())}}"""
+                    "tool_use" -> """{"type":"tool_use","id":"${block["id"].asText()}","name":"${block["name"].asText()}","input":{}}""" to
+                        """{"type":"input_json_delta","partial_json":${mapper.writeValueAsString(block["input"].toString())}}"""
+                    else -> """{"type":"text","text":""}""" to
+                        """{"type":"text_delta","text":${mapper.writeValueAsString(block["text"].asText())}}"""
+                }
+                append(event("content_block_start", """{"type":"content_block_start","index":$index,"content_block":$start}"""))
+                append(event("content_block_delta", """{"type":"content_block_delta","index":$index,"delta":$delta}"""))
+                append(event("content_block_stop", """{"type":"content_block_stop","index":$index}"""))
+            }
+            append(event("message_delta", """{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}"""))
+            append(event("message_stop", """{"type":"message_stop"}"""))
+        }
+    }
+
+    private fun blockTypes(content: JsonNode) = content.map { it["type"].asText() }
 
     private fun service(model: String) =
         AnthropicModelFactory(apiKey = "test-key", baseUrl = "http://localhost:${server.address.port}")
@@ -154,6 +183,29 @@ class AnthropicWireTest {
             listOf("text", "tool_use"),
             request["messages"][1]["content"].map { it["type"].asText() },
         )
+    }
+
+    /** Spring AI groups thinking ahead of tool calls, so even a turn without text can be reordered. */
+    @Test
+    fun `an unrecorded turn without text goes back without its thinking`() {
+        responseContent = """[{"type":"thinking","thinking":"","signature":"sigA"},
+            {"type":"tool_use","id":"toolu_a","name":"lookup","input":{}},
+            {"type":"thinking","thinking":"","signature":"sigB"},
+            {"type":"tool_use","id":"toolu_b","name":"lookup","input":{}}]"""
+        val user = UserMessage("Look both up")
+        val first = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions())
+            .call(listOf(user), emptyList())
+
+        responseContent = """[{"type":"text","text":"Done"}]"""
+        service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions()).call(
+            listOf(
+                user, first.message,
+                ToolResultMessage("toolu_a", "lookup", "a"), ToolResultMessage("toolu_b", "lookup", "b"),
+            ),
+            emptyList(),
+        )
+
+        assertEquals(listOf("tool_use", "tool_use"), blockTypes(request["messages"][1]["content"]))
     }
 
     /**

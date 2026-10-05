@@ -39,8 +39,8 @@ import java.util.concurrent.CompletableFuture
  * This interceptor records the content of each Messages response that calls tools and puts it
  * back in place of the rebuilt turn, matched on the turn's tool_use ids.
  *
- * A rebuilt turn it has no record of (evicted, streamed, or from before a restart) can't be
- * restored, so its thinking blocks and every earlier one are left out instead: the API accepts
+ * A turn carrying thinking that it has no record of (evicted, streamed, or from before a
+ * restart) can't be proven unchanged, so its thinking blocks and every earlier one are left out instead: the API accepts
  * thinking dropped from the start of the history, at the cost of that reasoning.
  *
  * ponytail: remembers the last [MAX_TURNS] tool-calling turns per client, in memory and only from
@@ -92,7 +92,9 @@ internal class AssistantTurnReplay : Interceptor {
                     message.set<JsonNode>("content", returned.deepCopy())
                     changed = true
                 }
-            } else if (mayBeReordered(content)) {
+            } else if (content.any { it["type"]?.asText() in THINKING_TYPES }) {
+                // Unproven: Spring AI's rebuild groups all text, then all thinking, then all tool
+                // calls, so even a turn without text may not match what Claude returned.
                 lastUnreplayable = index
             }
         }
@@ -112,13 +114,6 @@ internal class AssistantTurnReplay : Interceptor {
         }
         return buffered.toBuilder().body(HttpRequestBody.ofJson(body)).build()
     }
-
-    /**
-     * Whether Spring AI's rebuild may differ from what Claude returned: the rebuild puts all text
-     * ahead of all thinking, which matches Claude's order only when there is no text.
-     */
-    private fun mayBeReordered(content: ArrayNode): Boolean =
-        content.any { it["type"]?.asText() in THINKING_TYPES } && content.any { it["type"]?.asText() == "text" }
 
     private fun record(response: HttpResponse): HttpResponse {
         val isJson = response.headers().values("Content-Type").any { it.startsWith("application/json") }
