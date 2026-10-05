@@ -16,7 +16,6 @@
 package com.embabel.agent.anthropic
 
 import com.embabel.agent.api.models.AnthropicModels
-import com.embabel.agent.api.tool.Tool
 import com.embabel.agent.spi.loop.streaming.LlmInferenceStreamEvent
 import com.embabel.chat.AssistantMessageWithToolCalls
 import com.embabel.chat.ToolResultMessage
@@ -183,6 +182,28 @@ class AnthropicWireTest {
             listOf("text", "tool_use"),
             request["messages"][1]["content"].map { it["type"].asText() },
         )
+    }
+
+    /**
+     * A streamed turn isn't recorded, so the Spring AI rebuild of it must not go back with its
+     * thinking moved behind the text.
+     */
+    @Test
+    fun `a streamed tool-calling turn goes back without its thinking rather than reordered`() {
+        responseContent = """[{"type":"thinking","thinking":"","signature":"sig1"},
+            {"type":"text","text":"Looking it up."},
+            {"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"x"}}]"""
+        val streamer = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageStreamer(LlmOptions())
+        val user = UserMessage("Look it up")
+
+        val first = streamer.streamInference(listOf(user), emptyList())
+            .ofType(LlmInferenceStreamEvent.Complete::class.java).blockLast()!!
+        responseContent = """[{"type":"text","text":"Done"}]"""
+        streamer.streamInference(
+            listOf(user, first.message, ToolResultMessage("toolu_1", "lookup", "found")), emptyList(),
+        ).blockLast()
+
+        assertEquals(listOf("text", "tool_use"), blockTypes(request["messages"][1]["content"]))
     }
 
     /** Spring AI groups thinking ahead of tool calls, so even a turn without text can be reordered. */

@@ -172,6 +172,7 @@ class AnthropicModelsConfig(
             .builder()
             .options(createDefaultOptions(modelDef))
             .anthropicClient(createAnthropicClient())
+            .anthropicClientAsync(createAnthropicClientAsync())
             .toolCallingManager(
                 ToolCallingManager.builder()
                     .observationRegistry(observationRegistry)

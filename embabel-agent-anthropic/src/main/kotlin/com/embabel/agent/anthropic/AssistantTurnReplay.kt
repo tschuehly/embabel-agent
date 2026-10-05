@@ -67,7 +67,9 @@ internal class AssistantTurnReplay : Interceptor {
         override fun executeAsync(
             request: HttpRequest,
             requestOptions: RequestOptions,
-        ): CompletableFuture<HttpResponse> = httpClient.executeAsync(request, requestOptions)
+        ): CompletableFuture<HttpResponse> =
+            // Streamed responses aren't recorded, so this only strips thinking it can't prove.
+            httpClient.executeAsync(if (isCreateMessage(request)) replay(request) else request, requestOptions)
 
         override fun close() = httpClient.close()
     }

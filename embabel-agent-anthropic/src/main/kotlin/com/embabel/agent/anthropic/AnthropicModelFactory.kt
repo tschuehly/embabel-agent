@@ -16,7 +16,9 @@
 package com.embabel.agent.anthropic
 
 import com.anthropic.client.AnthropicClient
+import com.anthropic.client.AnthropicClientAsync
 import com.anthropic.client.okhttp.AnthropicOkHttpClient
+import com.anthropic.client.okhttp.AnthropicOkHttpClientAsync
 import com.embabel.agent.api.models.AnthropicModels
 import com.embabel.agent.spi.LlmService
 import com.embabel.agent.spi.support.springai.SpringAiLlmService
@@ -110,6 +112,22 @@ open class AnthropicModelFactory(
     }
 
     /**
+     * The streaming counterpart of [createAnthropicClient], with the same credentials. Without it
+     * Spring AI builds its own from `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`, so streamed calls
+     * would ignore the factory's key and base URL.
+     */
+    protected fun createAnthropicClientAsync(): AnthropicClientAsync {
+        val builder = AnthropicOkHttpClientAsync.builder()
+            .apiKey(apiKey)
+            .timeout(READ_TIMEOUT)
+            .addInterceptor(AssistantTurnReplay())
+        if (!baseUrl.isNullOrBlank()) {
+            builder.baseUrl(baseUrl)
+        }
+        return builder.build()
+    }
+
+    /**
      * Builds an [LlmService] for the given Anthropic model.
      *
      * Spring AI 2.0 dropped the spring-retry `RetryTemplate` parameter on the chat model
@@ -138,6 +156,7 @@ open class AnthropicModelFactory(
         val chatModel = AnthropicChatModel.builder()
             .options(AnthropicChatOptions.builder().model(model).build())
             .anthropicClient(createAnthropicClient())
+            .anthropicClientAsync(createAnthropicClientAsync())
             .toolCallingManager(
                 ToolCallingManager.builder().observationRegistry(observationRegistry).build()
             )
