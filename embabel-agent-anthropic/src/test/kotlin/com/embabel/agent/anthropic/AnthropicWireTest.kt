@@ -26,16 +26,21 @@ import com.embabel.common.ai.model.Thinking
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpServer
+import io.micrometer.observation.Observation
+import io.micrometer.observation.ObservationHandler
+import io.micrometer.observation.ObservationRegistry
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Drives a real [org.springframework.ai.anthropic.AnthropicChatModel] against a local stub of
@@ -253,6 +258,28 @@ class AnthropicWireTest {
             request["tools"][0]["input_schema"]["properties"]["cache_control"]["description"].asText(),
         )
         assertEquals(listOf("text", "tool_use"), blockTypes(request["messages"][1]["content"]))
+    }
+
+    /** Streaming must not lose the per-request HTTP observation Spring AI's own client records. */
+    @Test
+    fun `a streamed call is observed at the http level`() {
+        val completed = CopyOnWriteArrayList<String>()
+        val registry = ObservationRegistry.create()
+        registry.observationConfig().observationHandler(object : ObservationHandler<Observation.Context> {
+            override fun supportsContext(context: Observation.Context) = true
+            override fun onStop(context: Observation.Context) {
+                completed.add(context.name)
+            }
+        })
+        val streamer = AnthropicModelFactory(
+            apiKey = "test-key",
+            baseUrl = "http://localhost:${server.address.port}",
+            observationRegistry = registry,
+        ).build(AnthropicModels.CLAUDE_FABLE_5_1).createMessageStreamer(LlmOptions())
+
+        streamer.streamInference(listOf(UserMessage("Hi")), emptyList()).blockLast()
+
+        assertTrue("okhttp.requests" in completed, "HTTP observations recorded: $completed")
     }
 
     @Test

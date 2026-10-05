@@ -18,7 +18,6 @@ package com.embabel.agent.anthropic
 import com.anthropic.client.AnthropicClient
 import com.anthropic.client.AnthropicClientAsync
 import com.anthropic.client.okhttp.AnthropicOkHttpClient
-import com.anthropic.client.okhttp.AnthropicOkHttpClientAsync
 import com.embabel.agent.api.models.AnthropicModels
 import com.embabel.agent.spi.LlmService
 import com.embabel.agent.spi.support.springai.SpringAiLlmService
@@ -33,6 +32,7 @@ import io.micrometer.observation.ObservationRegistry
 import org.slf4j.LoggerFactory
 import org.springframework.ai.anthropic.AnthropicChatModel
 import org.springframework.ai.anthropic.AnthropicChatOptions
+import org.springframework.ai.anthropic.AnthropicSetup
 import org.springframework.ai.model.tool.ToolCallingManager
 import org.springframework.beans.factory.ObjectProvider
 import org.springframework.retry.support.RetryTemplate
@@ -88,6 +88,8 @@ open class AnthropicModelFactory(
         const val VALIDATION_MODEL = AnthropicModels.CLAUDE_HAIKU_4_5
 
         private val READ_TIMEOUT: Duration = Duration.ofMillis(600_000)
+
+        private const val DEFAULT_BASE_URL = "https://api.anthropic.com"
     }
 
     /**
@@ -112,20 +114,23 @@ open class AnthropicModelFactory(
     }
 
     /**
-     * The streaming counterpart of [createAnthropicClient], with the same credentials. Without it
-     * Spring AI builds its own from `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`, so streamed calls
-     * would ignore the factory's key and base URL.
+     * The streaming counterpart of [createAnthropicClient], with the same credentials. Left to
+     * itself Spring AI builds this client from `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`, so
+     * streamed calls would ignore the factory's key and base URL. It is built the way Spring AI
+     * builds it otherwise, so each HTTP attempt is still observed on [observationRegistry].
      */
-    protected fun createAnthropicClientAsync(): AnthropicClientAsync {
-        val builder = AnthropicOkHttpClientAsync.builder()
-            .apiKey(apiKey)
-            .timeout(READ_TIMEOUT)
-            .addInterceptor(AssistantTurnReplay())
-        if (!baseUrl.isNullOrBlank()) {
-            builder.baseUrl(baseUrl)
-        }
-        return builder.build()
-    }
+    protected fun createAnthropicClientAsync(): AnthropicClientAsync =
+        AnthropicSetup.setupAsyncClient(
+            // Explicit, so Spring AI does not fall back to ANTHROPIC_BASE_URL.
+            baseUrl?.takeUnless { it.isBlank() } ?: DEFAULT_BASE_URL,
+            apiKey,
+            READ_TIMEOUT,
+            null,
+            null,
+            null,
+            observationRegistry,
+            null,
+        ).withOptions { it.addInterceptor(AssistantTurnReplay()) }
 
     /**
      * Builds an [LlmService] for the given Anthropic model.
