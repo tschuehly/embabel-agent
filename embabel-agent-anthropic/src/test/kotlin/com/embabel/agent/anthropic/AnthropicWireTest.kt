@@ -272,21 +272,7 @@ class AnthropicWireTest {
                 )
             }
         }
-        val loop = ToolLoopFactory.create(
-            ToolLoopConfiguration(), ExecutorAsyncer(Executors.newSingleThreadExecutor()), AutoCorrectionPolicy(),
-        ).create(
-            llmMessageSender = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions()),
-            objectMapper = JsonMapper.builder().build(),
-            injectionStrategy = ToolInjectionStrategy.NONE,
-            maxIterations = 5,
-            toolDecorator = null,
-            toolLoopInspectors = emptyList(),
-            toolLoopTransformers = listOf(correcting),
-            toolCallInspectors = emptyList(),
-            toolCallContext = ToolCallContext.EMPTY,
-        )
-
-        loop.execute(listOf(UserMessage("Look it up")), listOf(lookup)) { it }
+        toolLoop(listOf(correcting)).execute(listOf(UserMessage("Look it up")), listOf(lookup)) { it }
 
         assertEquals(listOf("""{"q":"corrected"}"""), executed)
         val sent = request["messages"][1]["content"]
@@ -294,6 +280,46 @@ class AnthropicWireTest {
         assertEquals("Redacted", sent[0]["text"].asText())
         assertEquals("corrected", sent[1]["input"]["q"].asText())
     }
+
+    /** A transformer that drops a turn's thinking means it: the recorded thinking must not come back. */
+    @Test
+    fun `a turn whose thinking a transformer removed goes back without it`() {
+        responseContent = """[{"type":"thinking","thinking":"","signature":"sig-drop"},
+            {"type":"text","text":"Looking it up."},
+            {"type":"tool_use","id":"toolu_drop","name":"lookup","input":{"q":"x"}}]"""
+        val lookup = Tool.of(
+            "lookup", "Look something up", Tool.InputSchema.of(Tool.Parameter.string("q", "query")),
+        ) { _ ->
+            responseContent = """[{"type":"text","text":"Done"}]"""
+            Tool.Result.text("found")
+        }
+        val withoutThinking = object : ToolLoopTransformer {
+            override fun transformAfterLlmCall(context: AfterLlmCallContext): Message {
+                val response = context.response as? AssistantMessageWithToolCalls ?: return context.response
+                return AssistantMessageWithToolCalls(content = response.content, toolCalls = response.toolCalls)
+            }
+        }
+
+        toolLoop(listOf(withoutThinking)).execute(listOf(UserMessage("Look it up")), listOf(lookup)) { it }
+
+        val sent = request["messages"][1]["content"]
+        assertEquals(listOf("text", "tool_use"), blockTypes(sent))
+        assertEquals("Looking it up.", sent[0]["text"].asText())
+    }
+
+    private fun toolLoop(transformers: List<ToolLoopTransformer>) = ToolLoopFactory.create(
+        ToolLoopConfiguration(), ExecutorAsyncer(Executors.newSingleThreadExecutor()), AutoCorrectionPolicy(),
+    ).create(
+        llmMessageSender = service(AnthropicModels.CLAUDE_FABLE_5_1).createMessageSender(LlmOptions()),
+        objectMapper = JsonMapper.builder().build(),
+        injectionStrategy = ToolInjectionStrategy.NONE,
+        maxIterations = 5,
+        toolDecorator = null,
+        toolLoopInspectors = emptyList(),
+        toolLoopTransformers = transformers,
+        toolCallInspectors = emptyList(),
+        toolCallContext = ToolCallContext.EMPTY,
+    )
 
     /** `cache_control` is only a marker where Anthropic places one; elsewhere it is the caller's data. */
     @Test
