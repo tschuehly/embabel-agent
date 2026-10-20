@@ -1017,6 +1017,7 @@
       <h2>How to Read Embabel Workflows</h2>
       <p>Embabel applications are built from small typed steps. Each action reads facts from the blackboard, adds new facts, and gives the planner more ways to reach a user-visible goal.</p>
       <p>Use this vocabulary while reading the examples. The guide introduces each idea in a working feature first, then shows the matching code.</p>
+      <p>Source-checked against Embabel Agent main <code>3e0f79b40207</code>. These are excerpts, not standalone source files: imports, surrounding configuration, and some class bodies are omitted. Follow each source link for the complete application. Tool-group calls and retired model selections are adapted to the current framework catalog.</p>
 
       <div class="concept-map">
         <div>
@@ -1204,7 +1205,8 @@ fun extractPerson(userInput: UserInput, context: OperationContext): Person? =
 
 @Action(cost = 100.0)
 internal fun makeStarry(person: Person): Starry =
-    fromForm(<span class="string">"Let's get some astrological details for ${person.name}"</span>)</code><span class="snippet-note indent-body"><code>fromForm</code> pauses for human input and returns a typed <code>Starry</code> object.</span><code>data class Starry(
+    fromForm(<span class="string">"Let's get some astrological details for ${person.name}"</span>)</code><span class="snippet-note indent-body"><code>fromForm</code> requests human input via a process interruption; the typed <code>Starry</code> response resumes the workflow.</span><code>data class Starry(
+    @Text(label = <span class="string">"Star sign"</span>)
     val sign: String,
 )
 
@@ -1237,27 +1239,46 @@ internal fun findNewsStories(
 	            ${person.name} is an astrology believer with the sign ${person.sign}.
 	            Their horoscope for today is:
 	                &lt;horoscope&gt;${horoscope.summary}&lt;/horoscope&gt;
-	            Given this, use web tools and generate search queries to find $storyCount
-	            relevant news stories. Include the URL for each story.
-	            Do not look for another horoscope reading.
+	            Given this, use web tools and generate search queries
+	            to find $storyCount relevant news stories summarize them in a few sentences.
+	            Include the URL for each story.
+	            Do not look for another horoscope reading or return results directly about astrology;
+	            find stories relevant to the reading above.
+
+	            For example:
+	            - If the horoscope says that they may
+	            want to work on relationships, you could find news stories about
+	            novel gifts
+	            - If the horoscope says that they may want to work on their career,
+	            find news stories about training courses.
 	            """</span>.trimIndent()
 	        )
 open class RelevantNewsStories(
     val items: List&lt;NewsStory&gt;,
-) : PromptContributor
+) : PromptContributor {
+    override fun contribution(): String {
+        return items.joinToString(<span class="string">"\n"</span>) {
+            it.contribution()
+        }.ifBlank { <span class="string">"No relevant news stories found."</span> }
+    }
+}
 
 open class NewsStory(
     override val url: String,
     val title: String,
     override val summary: String,
-) : PromptContributor, Page</code></pre>
+) : PromptContributor, Page {
+    override fun contribution(): String {
+        return <span class="string">"Title: $title\nSummary: $summary\nURL: $url"</span>
+    }
+}</code></pre>
 
       <div class="explain-box">
         <strong>What <code>PromptContributor</code> does</strong>
         <code>PromptContributor</code> lets a domain object provide its own prompt representation when it is included in Embabel prompt construction. Instead of every action manually formatting the same object into text, the object can define a reusable contribution that prompt runners can include consistently.
       </div>
 
-      <p>The final action consumes the objects already produced by the flow and marks the user-visible result with <code>@AchievesGoal</code>.</p>
+      <p>The final action consumes the objects already produced by the flow and marks the user-visible result with <code>@AchievesGoal</code>. The source also exports this goal remotely; that annotation detail is omitted here and explained in Feature 2. The domain prompt contributors above come from <code>embabel-agent-domain/src/main/kotlin/com/embabel/agent/domain/library/NewsStory.kt</code>.</p>
 
       <pre><code>@AchievesGoal(
     description = <span class="string">"Create an amusing writeup for the target person based on their horoscope and current news stories"</span>,
@@ -1273,12 +1294,16 @@ fun starNewsWriteup(
 	        .withLlm(LlmOptions.withModel(model).withTemperature(0.9))
 	        .createObject(
 	            <span class="string">"""
-	            Take the following news stories and write up something amusing for the target person.
-	            Begin by summarizing their horoscope, then talk about the news.
+	            Take the following news stories and write up something
+	            amusing for the target person in $wordCount words.
+
+	            Begin by summarizing their horoscope in a concise, amusing way, then
+	            talk about the news. End with a surprising signoff.
 
 	            ${person.name} is an astrology believer with the sign ${person.sign}.
-	            Horoscope: &lt;horoscope&gt;${horoscope.summary}&lt;/horoscope&gt;
-	            Relevant news stories:
+	            Their horoscope for today is:
+	                &lt;horoscope&gt;${horoscope.summary}&lt;/horoscope&gt;
+	            Relevant news stories are:
 	            ${relevantNewsStories.items.joinToString("\n") { "- ${it.url}: ${it.summary}" }}
 
 	            Format it as Markdown with links.
@@ -1378,7 +1403,7 @@ flowchart LR
       </div>
 
       <p>The agent class is the capability boundary. Embabel registers the actions in the class as one news-briefing capability.</p>
-      <p><code>@SecureAgentTool</code> is the security boundary for remote tool use. It attaches a Spring Security expression to the exported capability, so a caller must have <code>news:read</code> authority before this agent can be used as a secured tool.</p>
+      <p>With the MCP security autoconfiguration installed, <code>@SecureAgentTool</code> enforces a Spring Security expression when a proxied action executes. This class-level annotation requires <code>news:read</code> authority for the agent's actions, not just its exported goal. Configure HTTP authentication separately; the annotation alone does not secure the transport.</p>
 
       <div class="explain-box">
         <strong>When tools need request metadata</strong>
@@ -1781,7 +1806,7 @@ fun synthesiseReport(...): MarketIntelligenceReport {
 }</code></pre>
 
       <div class="callout">
-        Market Intelligence's key lesson: gather evidence once, keep each section as typed blackboard state, and use narrow structured-output calls to assemble a decision-ready report.
+        Market Intelligence's key lesson: gather evidence once on the blackboard, keep report sections as typed local values inside the goal action, and assemble a decision-ready report. Only the returned MarketIntelligenceReport becomes a new blackboard fact.
       </div>
     </section>
 
@@ -1919,7 +1944,9 @@ class Researcher(
 data class SingleLlmReport(
     val report: ResearchReport,
     val model: String,
-) : Timestamped
+) : Timestamped {
+    override val timestamp: Instant = Instant.now()
+}
 
 data class Critique(
     val accepted: Boolean,
@@ -1957,6 +1984,7 @@ data class Categorization(
       <div class="subfeature">
         <h3>4.3 Create Independent Named Reports</h3>
         <p>The product wants two independent research passes. Both actions return <code>SingleLlmReport</code>, so type alone is not enough to tell them apart. <code>outputBinding</code> gives each report a stable blackboard name.</p>
+        <p><code>gpt4Report</code> and <code>researchWithGpt4</code> are source identifiers, not model requirements. Models come from <code>ResearcherProperties</code> under <code>embabel.examples.researcher</code>. Override its retired Claude default with <code>embabel.examples.researcher.claude-model-name=claude-haiku-4-5</code>. Its GPT-4.1 defaults are still in the current OpenAI catalog; GPT-6 Astra, Sol, and Luna are also available. The merge action uses <code>criticModeName</code>, not the currently unused <code>mergeModelName</code>.</p>
 
         <pre><code><span class="comment">// These need a different output binding or only one will run</span>
 @Action(
@@ -2036,6 +2064,9 @@ fun researchWithClaude(
         If you can answer the question more briefly, do so.
         Including a number of links that are relevant to the topic.
 
+        Example:
+        ${PromptUtils.jsonExampleOf&lt;ResearchReport&gt;()}
+
         Question:
         &lt;${userInput.content}&gt;
 
@@ -2043,7 +2074,8 @@ fun researchWithClaude(
         """</span>.trimIndent()
     )</code></pre>
 
-        <pre><code>open class ResearchReport(
+        <pre><code><span class="comment">// Shape excerpt from domain/library/Research.kt; method bodies and annotations omitted.</span>
+open class ResearchReport(
     val topic: String,
     override val content: String,
     override val links: List&lt;InternetResource&gt;,
@@ -2317,12 +2349,12 @@ data class FactCheckerProperties(
 fun factChecker(factCheckerProperties: FactCheckerProperties): Agent {
     return factCheckerAgent(
         llms = listOf(
-            LlmOptions(AnthropicModels.CLAUDE_35_HAIKU).withTemperature(.3),
-            LlmOptions(AnthropicModels.CLAUDE_35_HAIKU).withTemperature(.0),
+            LlmOptions(AnthropicModels.CLAUDE_HAIKU_4_5).withTemperature(.3),
+            LlmOptions(AnthropicModels.CLAUDE_HAIKU_4_5).withTemperature(.0),
         ),
         properties = factCheckerProperties,
     )
-}</code><span class="snippet-note">The configured <code>llms</code> list deliberately runs the same extractor with two model settings. The aggregate stage then merges their typed results.</span></pre>
+}</code><span class="snippet-note">The configured <code>llms</code> list deliberately runs the same extractor with two model settings. The aggregate stage then merges their typed results. Haiku 4.5 replaces the source example's retired Haiku 3.5; see <code>AnthropicModels.kt</code> and <code>models/anthropic-models.yml</code> in the framework.</span></pre>
 
         <pre><code>fun factCheckerAgent(
     llms: List&lt;LlmOptions&gt;,
@@ -2420,7 +2452,7 @@ data class FactCheck(
         <pre><code>transformation&lt;RationalizedFactualAssertions, FactCheck&gt; { operationContext -></code><span class="snippet-note"><code>transformation</code> is the DSL version of a typed action: the current <code>RationalizedFactualAssertions</code> input must produce one <code>FactCheck</code> output.</span><code>
     val promptRunner = operationContext.ai()
         .withAutoLlm()
-        .withTools(
+        .withToolGroups(
             CoreToolGroups.WEB,
             CoreToolGroups.BROWSER_AUTOMATION,
         )</code><span class="snippet-note indent-chain">The verifier gets web search plus browser automation because checking a claim may require both finding sources and inspecting pages.</span><code>
@@ -2438,7 +2470,7 @@ data class FactCheck(
                 Assertion: &lt;${assertion.standaloneAssertion}&gt;
                 """</span>
         )
-    }</code><span class="snippet-note"><code>operationContext</code> is passed into <code>parallelMap</code>, so every concurrent check still runs in the same process context and can use the current input, tools, and prompt configuration.</span><code>
+    }</code><span class="snippet-note">This collection extension uses coroutines with a default concurrency limit of 10. Its current implementation accepts but does not use <code>operationContext</code>; the captured <code>promptRunner</code> carries the configured model and tools. Do not infer thread-local security propagation from this parameter.</span><code>
 
     FactCheck(checks)
 }</code></pre>
@@ -2523,8 +2555,9 @@ flowchart LR
 
   seed --> planner1["GOAP planner&lt;br/&gt;facts satisfy action inputs"]
   planner1 --> consent
+  planner1 --> poi
   consent --> planner2["replan from blackboard"]
-  planner2 --> poi
+  planner2 --> planner3
   poi --> planner3["replan from blackboard"]
   planner3 --> research
   research --> planner4["replan from blackboard"]
@@ -2574,7 +2607,7 @@ flowchart LR
               </ul>
             </div>
           </details>
-          <p class="diagram-note">After each action, GOAP replans from the current typed blackboard facts. The next action becomes valid when its input types are present; the exported goal is satisfied by the cleaned <code>TravelPlan</code>.</p>
+          <p class="diagram-note">GOAP replans from typed facts. Consent and POI discovery are independently eligible from the seed facts; only <code>researchPointsOfInterest</code> requires both <code>ItineraryIdeas</code> and <code>AcceptanceOfCost</code>. The flow strip shows one possible order, not a fixed sequence. The exported goal is satisfied by the cleaned <code>TravelPlan</code>.</p>
         </div>
       </div>
 
@@ -2733,7 +2766,7 @@ return when (agentProcess.status) {
 
       <div class="subfeature">
         <h3>6.3 Put Consent and Remote Input into the Plan</h3>
-        <p>Expensive research is unlocked by a typed fact, <code>AcceptanceOfCost</code>. The direct web form path creates the brief and travelers itself. The exported remote path starts with <code>TravelersAndBrief</code>, so Tripper asks for confirmation before doing the expensive work.</p>
+        <p>Parallel POI research is unlocked by <code>AcceptanceOfCost</code>. The direct web form path grants it without asking. The exported remote path starts with <code>TravelersAndBrief</code> and requests confirmation. POI discovery does not require this fact and can incur model/tool costs before confirmation; this example is not an all-spending approval gate.</p>
         <p><code>context.last&lt;TravelersAndBrief&gt;()</code> checks whether the composite remote input was part of the current process history. Tripper uses that to decide whether a confirmation step is needed.</p>
         <p>The blackboard is process memory: it holds the brief, travelers, and consent for this run. A longer-lived context is different; use a context when future processes or chat sessions should start with remembered project, user, or account state.</p>
 
@@ -2789,7 +2822,7 @@ fun findPointsOfInterest(
         .withPromptElements(
             config.planner,
             travelers,
-        ).withTools(
+        ).withToolGroups(
             CoreToolGroups.WEB,
             CoreToolGroups.MAPS,
             CoreToolGroups.MATH,
@@ -2835,7 +2868,7 @@ fun researchPointsOfInterest(
 ): PointOfInterestFindings {
     val promptRunner = config.researcher.promptRunner(context)
         .withPromptElements(travelers, config.toolCallControl)
-        .withTools(
+        .withToolGroups(
             CoreToolGroups.WEB,
             CoreToolGroups.BROWSER_AUTOMATION,
             WEATHER_TOOLS,
@@ -2872,7 +2905,7 @@ fun researchPointsOfInterest(
 
       <div class="subfeature">
         <h3>6.6 Synthesize a Plan from Researched Evidence</h3>
-        <p>The itinerary action consumes researched facts rather than browsing from scratch. It produces HTML for the user and structured fields for later deterministic steps.</p>
+        <p>The itinerary action requires <code>PointOfInterestFindings</code> as a planning input and produces HTML plus structured fields. However, the source prompt does not interpolate <code>poiFindings</code>; an action parameter is not automatically included in the prompt. This excerpt also enables web, maps, and math tools, so synthesis is not an evidence-only, tool-free step.</p>
 
         <pre><code>data class Day(
     val date: LocalDate,
@@ -2907,7 +2940,7 @@ fun proposeTravelPlan(
     context: OperationContext,
 ): ProposedTravelPlan {
     return config.planner.promptRunner(context)
-        .withTools(CoreToolGroups.WEB, CoreToolGroups.MAPS, CoreToolGroups.MATH)
+        .withToolGroups(CoreToolGroups.WEB, CoreToolGroups.MAPS, CoreToolGroups.MATH)
         .withPromptElements(
             travelers, ResponseFormat.HTML,
         )</code><span class="snippet-note indent-chain"><code>ResponseFormat.HTML</code> is prompt context; the return type still enforces <code>ProposedTravelPlan</code>.</span><code>
@@ -2944,7 +2977,7 @@ fun proposeTravelPlan(
 
       <div class="subfeature">
         <h3>6.7 Add Accommodation Links with a Custom MCP ToolGroup</h3>
-        <p>Accommodation search extends the earlier tool-group idea. Instead of using only built-in groups like web or maps, Tripper defines an MCP-backed Airbnb group, then combines it with math tools to find stay links within budget.</p>
+        <p>Accommodation search extends the earlier tool-group idea. Instead of using only well-known group roles like web or maps, Tripper defines an MCP-backed Airbnb group, then combines it with math tools to find stay links within budget. Roles still require configured tool providers. Current <code>PromptRunner.withToolGroups</code> accepts role strings; <code>withTools</code> now accepts native <code>Tool</code> objects.</p>
         <p><code>McpToolGroup</code> adapts tools provided by MCP clients into an Embabel <code>ToolGroup</code>. The <code>filter</code> narrows the provider's tools to Airbnb-related tools, and <code>ToolGroupPermission.INTERNET_ACCESS</code> makes the external network permission explicit.</p>
         <p>If a provider exposes a large tool catalog, prefer narrow or progressive exposure over handing every tool to every prompt. The goal is to make the model choose among relevant capabilities, not browse an API catalog while solving the user's problem.</p>
 
@@ -3002,7 +3035,7 @@ fun findPlacesToSleep(
 
     val stayFinderPromptRunner = config.researcher.promptRunner(context)
         .withPromptContributor(travelers)
-        .withTools(ToolsConfig.AIRBNB, CoreToolGroups.MATH)</code><span class="snippet-note indent-chain">The MCP accommodation group composes with a core math group inside one prompt runner.</span><code>
+        .withToolGroups(ToolsConfig.AIRBNB, CoreToolGroups.MATH)</code><span class="snippet-note indent-chain">The MCP accommodation group composes with a core math group inside one prompt runner.</span><code>
     val foundStays = context.parallelMap(stays, maxConcurrency = config.maxConcurrency) { stay -&gt;
         val airbnbResults = stayFinderPromptRunner
             .create&lt;AirbnbResultsLlmReturn&gt;(
@@ -3124,7 +3157,7 @@ private val styleImages = StringTransformer { html -&gt;
           </ul>
 
           <h3>Why Embabel Fits</h3>
-          <p>The feature has two durable product states: an indexed knowledge base and an ongoing conversation. Earlier sections used tool groups for web and app capabilities; here <code>ToolishRag</code> turns retrieval itself into an LLM reference the model can call during a chat turn.</p>
+          <p>The feature has two kinds of state: a persistent indexed knowledge base and an ongoing, in-memory conversation. The shown <code>InMemoryConversationFactory</code> does not preserve chat history across restarts. Earlier sections used tool groups for web and app capabilities; here <code>ToolishRag</code> turns retrieval itself into an LLM reference the model can call during a chat turn.</p>
 
           <ul class="concept-list">
             <li><span>SearchOperations</span></li>
@@ -3452,6 +3485,13 @@ flowchart LR
 
       <pre><code>val context = FakeOperationContext()
 val runner = context.promptRunner()</code><span class="snippet-note"><code>FakePromptRunner</code> is reachable through the context and records every prompt interaction.</span><code>
+
+val wordCount = 100
+val starNewsFinder = StarNewsFinder(
+    horoscopeService = mockk(),
+    storyCount = 5,
+    wordCount = wordCount,
+)
 
 <span class="comment">// Product setup: typed fixtures mirror the real blackboard facts for this action.</span>
 val starPerson = StarPerson(name = <span class="string">"Lynda"</span>, sign = <span class="string">"Scorpio"</span>)
